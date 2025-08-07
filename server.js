@@ -2,6 +2,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const multer = require('multer');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -10,6 +12,34 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// Static file serving for uploaded images
+app.use('/uploads', express.static('uploads'));
+
+// Multer configuration for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, 'uploads/');
+  },
+  filename: function (req, file, cb) {
+    cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  fileFilter: function (req, file, cb) {
+    // Check file type
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed!'), false);
+    }
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  }
+});
 
 // MongoDB connection
 mongoose.connect('mongodb://localhost:27017/inventory_kiosk', {
@@ -26,21 +56,54 @@ db.once('open', function() {
 // Product Schema
 const productSchema = new mongoose.Schema({
   name: { type: String, required: true },
-  description: { type: String, required: true },
-  price: { type: Number, required: true },
-  stock: { type: Number, required: true },
+  details: { type: String, required: true }, // Changed from description to details
+  brand: { type: String, required: true },
   category: { type: String, required: true },
+  stockQty: { type: Number, required: true }, // Changed from stock to stockQty
+  unit: { type: String, required: true },
+  price: { type: Number, required: true },
+  image: { type: String, default: '' }, // For file path/URL
+  
+  // Variant system
+  sizeOptions: [{ type: String }],
+  colorOptions: [{ type: String }],
+  sizeColorQuantities: [{
+    size: String,
+    color: String,
+    quantity: Number
+  }],
+  colorQuantities: [{
+    color: String,
+    quantity: Number
+  }],
+  sizeQuantities: [{
+    size: String,
+    quantity: Number
+  }],
+  variantSize: { type: String, default: '' },
+  variantColor: { type: String, default: '' },
+  
+  // Location tracking
   location: {
     x: { type: Number, default: 0 },
     y: { type: Number, default: 0 },
     floor: { type: String, default: 'Ground Floor' }
   },
-  imageUrl: { type: String, default: '' },
+  
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
 
 const Product = mongoose.model('Product', productSchema);
+
+// Category Schema
+const categorySchema = new mongoose.Schema({
+  name: { type: String, required: true, unique: true },
+  description: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Category = mongoose.model('Category', categorySchema);
 
 // Map Schema for dynamic mapping
 const mapSchema = new mongoose.Schema({
@@ -78,17 +141,34 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// Add new product
-app.post('/api/products', async (req, res) => {
+// Add new product with file upload
+app.post('/api/products', upload.single('image'), async (req, res) => {
   try {
+    // Parse JSON fields that were stringified
+    const sizeColorQuantities = req.body.sizeColorQuantities ? JSON.parse(req.body.sizeColorQuantities) : [];
+    const colorQuantities = req.body.colorQuantities ? JSON.parse(req.body.colorQuantities) : [];
+    const sizeQuantities = req.body.sizeQuantities ? JSON.parse(req.body.sizeQuantities) : [];
+    
     const product = new Product({
       name: req.body.name,
-      description: req.body.description,
-      price: req.body.price,
-      stock: req.body.stock,
+      details: req.body.details,
+      brand: req.body.brand,
       category: req.body.category,
-      location: req.body.location || { x: 0, y: 0, floor: 'Ground Floor' },
-      imageUrl: req.body.imageUrl || ''
+      stockQty: parseInt(req.body.stockQty) || 0,
+      unit: req.body.unit,
+      price: parseFloat(req.body.price),
+      image: req.file ? `/uploads/${req.file.filename}` : '',
+      
+      // Variant data
+      sizeOptions: req.body.sizeOptions ? req.body.sizeOptions.split(',').filter(s => s.trim()) : [],
+      colorOptions: req.body.colorOptions ? req.body.colorOptions.split(',').filter(c => c.trim()) : [],
+      sizeColorQuantities: sizeColorQuantities,
+      colorQuantities: colorQuantities,
+      sizeQuantities: sizeQuantities,
+      variantSize: req.body.variantSize || '',
+      variantColor: req.body.variantColor || '',
+      
+      location: req.body.location ? JSON.parse(req.body.location) : { x: 0, y: 0, floor: 'Ground Floor' }
     });
     
     const savedProduct = await product.save();
@@ -143,12 +223,45 @@ app.get('/api/products/search/:query', async (req, res) => {
     const products = await Product.find({
       $or: [
         { name: { $regex: query, $options: 'i' } },
-        { description: { $regex: query, $options: 'i' } },
+        { details: { $regex: query, $options: 'i' } },
+        { brand: { $regex: query, $options: 'i' } },
         { category: { $regex: query, $options: 'i' } }
       ],
-      stock: { $gt: 0 } // Only show products in stock
+      stockQty: { $gt: 0 } // Only show products in stock
     });
     res.json(products);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Category routes
+app.get('/categories', async (req, res) => {
+  try {
+    const categories = await Category.find().sort({ name: 1 });
+    res.json(categories);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/categories', async (req, res) => {
+  try {
+    const category = new Category({
+      name: req.body.name,
+      description: req.body.description || ''
+    });
+    const savedCategory = await category.save();
+    res.status(201).json(savedCategory);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+});
+
+app.delete('/categories/:id', async (req, res) => {
+  try {
+    await Category.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Category deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
